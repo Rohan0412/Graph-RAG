@@ -17,3 +17,4 @@ azure-core
 azure-identity 
 PyMuPDF
 PyYAML
+pypdf
