@@ -414,7 +414,7 @@ def init_cosmos():
 
 
 def upsert_entity(gremlin_client, entity: Dict[str, Any]):
-    entity_id = entity.get("id")
+    entity_id = str(entity.get("id"))
     entity_name = entity.get("name", "Unnamed")
     entity_type = entity.get("type", "Entity")
     partition_key_value = entity_id  
@@ -737,8 +737,8 @@ def run_indexing_pipeline():
     # index_chunks_to_search(all_chunks, vectors)
     
     # 7) build graph & save to Cosmos
-    gremlin_client = init_cosmos()
-    build_graph_from_chunks(openai_client, gremlin_client, all_chunks)
+    # gremlin_client = init_cosmos()
+    # build_graph_from_chunks(openai_client, gremlin_client, all_chunks)
     
     print("Indexing pipeline finished.")
 
