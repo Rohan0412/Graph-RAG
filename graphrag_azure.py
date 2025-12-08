@@ -584,21 +584,61 @@ def init_cosmos_with_validation():
 # -------------------------
 # Retrieval + graph-based expansion
 # -------------------------
+# def vector_search(
+#     query: str, openai_client: AzureOpenAI, top_k: int = 5
+# ) -> List[Dict[str, Any]]:
+#     """Embed query -> ask Azure Search for top_k similar chunks"""
+#     q_emb = create_embeddings([query])[0]
+#     import pdb;pdb.set_trace()
+#     credential = AzureKeyCredential(AZURE_SEARCH_API_KEY)
+#     sclient = SearchClient(
+#         endpoint=AZURE_SEARCH_ENDPOINT,
+#         index_name=AZURE_SEARCH_INDEX_NAME,
+#         credential=credential,
+#     )
+#     # The azure search vector search API format:
+#     results = sclient.search(
+#         search_text="*", vector={"value": q_emb, "k": top_k, "fields": "vector"}
+#     )
+#     top_chunks = []
+#     for r in results:
+#         top_chunks.append(
+#             {
+#                 "id": r["id"],
+#                 "content": r["content"],
+#                 "score": r.get("@search.score", None),
+#             }
+#         )
+#     return top_chunks
+
+
+from azure.search.documents.models import VectorizedQuery
+
 def vector_search(
-    query: str, openai_client: AzureOpenAI, top_k: int = 5
+    query_vector: List[float],  # take precomputed vector
+    top_k: int = 5
 ) -> List[Dict[str, Any]]:
-    """Embed query -> ask Azure Search for top_k similar chunks"""
-    q_emb = create_embeddings([query])[0]
+    """Use precomputed query embedding to ask Azure Search for top_k similar chunks"""
     credential = AzureKeyCredential(AZURE_SEARCH_API_KEY)
     sclient = SearchClient(
         endpoint=AZURE_SEARCH_ENDPOINT,
         index_name=AZURE_SEARCH_INDEX_NAME,
         credential=credential,
     )
-    # The azure search vector search API format:
-    results = sclient.search(
-        search_text="*", vector={"value": q_emb, "k": top_k, "fields": "vector"}
+
+    # ✅ Use VectorizedQuery with kind="vector"
+    vector_query = VectorizedQuery(
+        vector=query_vector,
+        k_nearest_neighbors=top_k,
+        fields="vector",
+        kind="vector"
     )
+
+    results = sclient.search(
+        search_text="*",
+        vector_queries=[vector_query]
+    )
+
     top_chunks = []
     for r in results:
         top_chunks.append(
@@ -724,33 +764,39 @@ def run_indexing_pipeline():
     print(f"Total chunks created: {len(all_chunks)}")
     
     # 4) create search index (one-time)
-    # create_search_index()
+    create_search_index()
     
     # 5) create embeddings
-    # texts = [c["text"] for c in all_chunks]
-    # print("Creating embeddings for", len(texts), "chunks...")
-    # vectors = create_embeddings(texts)
+    texts = [c["text"] for c in all_chunks]
+    print("Creating embeddings for", len(texts), "chunks...")
+    vectors = create_embeddings(texts)
     
-    # print(f"Created {len(vectors)} embeddings")
+    print(f"Created {len(vectors)} embeddings")
     
-    # # 6) index to Azure Search
-    # index_chunks_to_search(all_chunks, vectors)
+    # 6) index to Azure Search
+    index_chunks_to_search(all_chunks, vectors)
     
     # 7) build graph & save to Cosmos
-    # gremlin_client = init_cosmos()
-    # build_graph_from_chunks(openai_client, gremlin_client, all_chunks)
+    gremlin_client = init_cosmos()
+    build_graph_from_chunks(openai_client, gremlin_client, all_chunks)
     
     print("Indexing pipeline finished.")
 
 def run_query_example(question: str):
+    print('Running the processing for openai_client....')
     openai_client = init_openai_client()
     # vector retrieval
-    top_chunks = vector_search(question, openai_client, top_k=6)
+    print('Running the processing for vector_search....')
+    top_chunks = vector_search(question, top_k=6)
     # pick seed entity names heuristically by extracting named entities from the question via LLM
+    print('Running the processing for llm_extract_entities_and_relations....')
     parsed = llm_extract_entities_and_relations(openai_client, question)
     seed_entities = [e.get("name") for e in parsed.get("entities", []) if e.get("name")]
+    print("Initialize cosmos client....")
     cosmos_client, cosmos_db, container = init_cosmos()
+    print('Running the processing for expand_with_graph....')
     graph_ctx = expand_with_graph(container, seed_entities or [question], max_hops=1)
+    print('Running the processing for generate_answer....')
     answer = generate_answer(openai_client, question, top_chunks, graph_ctx)
     return {"answer": answer, "retrieved": top_chunks, "graph_ctx": graph_ctx}
 
@@ -761,23 +807,52 @@ def run_query_example(question: str):
 if __name__ == "__main__":
     import argparse
 
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--mode", choices=["index", "query"], default="index")
+    # parser.add_argument("--question", type=str, default="")
+    # args = parser.parse_args()
+
+    # if args.mode == "index":
+    #     run_indexing_pipeline()
+    # else:
+    #     if not args.question:
+    #         print("Pass --question 'your question' in query mode.")
+    #     else:
+    #         print("Starting the processing for run query....")
+    #         res = run_query_example(args.question)
+    #         print("\n=== ANSWER ===\n")
+    #         print(res["answer"])
+    #         print("\n=== RETRIEVED CHUNKS ===\n")
+    #         for r in res["retrieved"]:
+    #             print("-", r["id"], r["content"][:300].replace("\n", " "))
+    #         print("\n=== GRAPH ENTITIES (sample) ===\n")
+    #         for e in res["graph_ctx"]["entities"][:20]:
+    #             print("-", e.get("id"), e.get("name"), e.get("type"))
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["index", "query"], default="index")
     parser.add_argument("--question", type=str, default="")
     args = parser.parse_args()
 
-    if args.mode == "index":
+    try:
+        print("Starting indexing pipeline...")
         run_indexing_pipeline()
-    else:
-        if not args.question:
-            print("Pass --question 'your question' in query mode.")
-        else:
-            res = run_query_example(args.question)
-            print("\n=== ANSWER ===\n")
-            print(res["answer"])
-            print("\n=== RETRIEVED CHUNKS ===\n")
-            for r in res["retrieved"]:
-                print("-", r["id"], r["content"][:300].replace("\n", " "))
-            print("\n=== GRAPH ENTITIES (sample) ===\n")
-            for e in res["graph_ctx"]["entities"][:20]:
-                print("-", e.get("id"), e.get("name"), e.get("type"))
+        print("Indexing pipeline completed successfully.")
+    except Exception as e:
+        print("Indexing pipeline failed:", e)
+        exit(1)  # Stop if indexing fails
+
+    # After successful indexing, run the query logic
+    
+    print("Starting the processing for run query....")
+    res = run_query_example(args.question)
+
+    print("\n=== ANSWER ===\n")
+    print(res["answer"])
+
+    print("\n=== RETRIEVED CHUNKS ===\n")
+    for r in res["retrieved"]:
+        print("-", r["id"], r["content"][:300].replace("\n", " "))
+
+    print("\n=== GRAPH ENTITIES (sample) ===\n")
+    for e in res["graph_ctx"]["entities"][:20]:
+        print("-", e.get("id"), e.get("name"), e.get("type"))
