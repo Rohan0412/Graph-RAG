@@ -707,15 +707,287 @@ class EnhancedDocumentProcessor:
 
 import importlib.util
 import shutil
+import tempfile
+from pathlib import Path
+import os
+import logging
+from typing import Dict, Any, Optional, List
+import subprocess
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+class BlobStorageManager:
+    """Manages PDF document fetching from Azure Blob Storage"""
+    
+    def __init__(self, azure_manager):
+        self.azure_manager = azure_manager
+        self.blob_service_client = azure_manager.blob_service_client
+        self.container_name = azure_manager.container_name
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="graphrag_pdfs_"))
+        
+    def fetch_pdf_from_blob(self, blob_name: str, local_filename: Optional[str] = None) -> Path:
+        """
+        Fetch a PDF file from Azure Blob Storage to local storage
+        
+        Args:
+            blob_name: Name of the blob in storage (e.g., "pdfs/document.pdf")
+            local_filename: Optional local filename, if not provided uses blob name
+            
+        Returns:
+            Path: Local file path of the downloaded PDF
+        """
+        try:
+            # Get blob client
+            blob_client = self.blob_service_client.get_blob_client(
+                container=self.container_name,
+                blob=blob_name
+            )
+            
+            # Check if blob exists
+            if not blob_client.exists():
+                raise FileNotFoundError(f"Blob not found: {blob_name}")
+            
+            # Determine local filename
+            if local_filename is None:
+                local_filename = Path(blob_name).name
+            
+            local_path = self.temp_dir / local_filename
+            
+            # Download the blob
+            with open(local_path, "wb") as download_file:
+                download_data = blob_client.download_blob()
+                download_file.write(download_data.readall())
+            
+            logger.info(f"PDF downloaded from blob: {blob_name} -> {local_path}")
+            return local_path
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch PDF from blob {blob_name}: {e}")
+            raise
+    
+    def fetch_all_pdfs_from_container(self, blob_prefix: str = "pdfs/") -> List[Path]:
+        """
+        Fetch all PDF files from a container with given prefix
+        
+        Args:
+            blob_prefix: Prefix to filter blobs (default: "pdfs/")
+            
+        Returns:
+            List[Path]: List of local file paths of downloaded PDFs
+        """
+        try:
+            container_client = self.blob_service_client.get_container_client(self.container_name)
+            blob_list = container_client.list_blobs(name_starts_with=blob_prefix)
+            
+            downloaded_files = []
+            
+            for blob in blob_list:
+                if blob.name.lower().endswith('.pdf'):
+                    try:
+                        local_path = self.fetch_pdf_from_blob(blob.name)
+                        downloaded_files.append(local_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to download {blob.name}: {e}")
+                        continue
+            
+            logger.info(f"Downloaded {len(downloaded_files)} PDF files from container")
+            return downloaded_files
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch PDFs from container: {e}")
+            raise
+    
+    def get_pdf_metadata_from_blob(self, blob_name: str) -> Dict[str, Any]:
+        """
+        Get metadata about a PDF blob without downloading it
+        
+        Args:
+            blob_name: Name of the blob
+            
+        Returns:
+            Dict: Blob metadata including size, last modified, etc.
+        """
+        try:
+            blob_client = self.blob_service_client.get_blob_client(
+                container=self.container_name,
+                blob=blob_name
+            )
+            
+            properties = blob_client.get_blob_properties()
+            
+            return {
+                "blob_name": blob_name,
+                "size": properties.size,
+                "last_modified": properties.last_modified,
+                "content_type": properties.content_settings.content_type,
+                "etag": properties.etag,
+                "url": blob_client.url
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get blob metadata for {blob_name}: {e}")
+            raise
+    
+    def cleanup_temp_files(self):
+        """Clean up temporary downloaded files"""
+        try:
+            if self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir)
+                logger.info("Temporary files cleaned up")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp files: {e}")
 
 class EnhancedGraphRAGRunner:
-    """Enhanced GraphRAG runner with Azure services integration"""
+    """Enhanced GraphRAG runner with Azure services integration and blob storage PDF fetching"""
     
-    def __init__(self, project_root: Path, azure_manager: AzureServiceManager):
+    def __init__(self, project_root: Path, azure_manager):
         self.project_root = project_root
         self.azure_manager = azure_manager
         self.cosmos_manager = CosmosDBManager(azure_manager)
         self.search_manager = AzureSearchManager(azure_manager)
+        self.blob_manager = BlobStorageManager(azure_manager)
+        
+    def fetch_and_prepare_pdfs_for_processing(self) -> List[Dict[str, Any]]:
+        """
+        Fetch PDFs from blob storage and prepare them for GraphRAG processing
+        
+        Returns:
+            List[Dict]: List of prepared PDF information
+        """
+        try:
+            print("📥 Fetching PDF documents from Azure Blob Storage...")
+            
+            # Get list of processed documents from Cosmos DB
+            processed_documents = self.cosmos_manager.list_processed_documents()
+            
+            prepared_pdfs = []
+            
+            for doc in processed_documents:
+                blob_url = doc.get('blob_url')
+                if not blob_url:
+                    continue
+                
+                # Extract blob name from URL
+                # URL format: https://storageaccount.blob.core.windows.net/container/blob_name
+                try:
+                    blob_name = blob_url.split('/')[-1]
+                    if not blob_name.endswith('.pdf'):
+                        # If the blob name doesn't end with .pdf, it might be in a folder
+                        url_parts = blob_url.split('/')
+                        container_index = url_parts.index(self.azure_manager.container_name)
+                        blob_name = '/'.join(url_parts[container_index + 1:])
+                    
+                    # Download PDF from blob storage
+                    local_pdf_path = self.blob_manager.fetch_pdf_from_blob(blob_name)
+                    
+                    prepared_pdfs.append({
+                        'document_id': doc['document_id'],
+                        'title': doc['title'],
+                        'local_path': local_pdf_path,
+                        'blob_name': blob_name,
+                        'blob_url': blob_url,
+                        'metadata': doc
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to process document {doc['document_id']}: {e}")
+                    continue
+            
+            logger.info(f"Successfully prepared {len(prepared_pdfs)} PDFs for processing")
+            return prepared_pdfs
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch and prepare PDFs: {e}")
+            raise
+    
+    def process_blob_pdfs_for_graphrag(self) -> bool:
+        """
+        Process PDFs from blob storage and create text files for GraphRAG
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            print("🔄 Processing PDFs from blob storage for GraphRAG...")
+            
+            # Fetch PDFs from blob storage
+            prepared_pdfs = self.fetch_and_prepare_pdfs_for_processing()
+            
+            if not prepared_pdfs:
+                print("⚠️ No PDFs found in blob storage or Cosmos DB")
+                return False
+            
+            # Ensure input directory exists
+            input_dir = self.project_root / "input"
+            input_dir.mkdir(exist_ok=True)
+            
+            # Process each PDF
+            for pdf_info in prepared_pdfs:
+                try:
+                    # Extract text from the downloaded PDF
+                    pdf_processor = PDFProcessor(self.azure_manager)
+                    pdf_data = pdf_processor.extract_text_from_pdf(str(pdf_info['local_path']))
+                    
+                    # Create text file for GraphRAG
+                    text_filename = f"{pdf_info['title'][:50].replace(' ', '_')}_{pdf_info['document_id'][:8]}.txt"
+                    text_file_path = input_dir / text_filename
+                    
+                    with open(text_file_path, 'w', encoding='utf-8') as f:
+                        f.write(f"Title: {pdf_info['title']}\n")
+                        f.write(f"Document ID: {pdf_info['document_id']}\n")
+                        f.write(f"Source: {pdf_info['blob_url']}\n")
+                        f.write(f"Author: {pdf_info['metadata'].get('author', '')}\n")
+                        f.write(f"Processing Date: {datetime.now().isoformat()}\n")
+                        f.write("\n" + "="*80 + "\n\n")
+                        f.write(pdf_data["full_text"])
+                    
+                    print(f"✅ Processed: {pdf_info['title']}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process PDF {pdf_info['title']}: {e}")
+                    continue
+            
+            print(f"🎯 Created {len(prepared_pdfs)} text files for GraphRAG processing")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to process blob PDFs for GraphRAG: {e}")
+            return False
+    
+    def list_available_pdfs_in_blob(self) -> List[Dict[str, Any]]:
+        """
+        List all available PDF files in blob storage
+        
+        Returns:
+            List[Dict]: List of available PDFs with metadata
+        """
+        try:
+            container_client = self.azure_manager.blob_service_client.get_container_client(
+                self.azure_manager.container_name
+            )
+            
+            blob_list = container_client.list_blobs(name_starts_with="pdfs/")
+            available_pdfs = []
+            
+            for blob in blob_list:
+                if blob.name.lower().endswith('.pdf'):
+                    try:
+                        metadata = self.blob_manager.get_pdf_metadata_from_blob(blob.name)
+                        available_pdfs.append(metadata)
+                    except Exception as e:
+                        logger.warning(f"Failed to get metadata for {blob.name}: {e}")
+                        continue
+            
+            print(f"📋 Found {len(available_pdfs)} PDF files in blob storage:")
+            for pdf in available_pdfs:
+                print(f"  - {pdf['blob_name']} ({pdf['size']} bytes)")
+            
+            return available_pdfs
+            
+        except Exception as e:
+            logger.error(f"Failed to list PDFs in blob storage: {e}")
+            return []
     
     def initialize_graphrag(self):
         """Initialize GraphRAG with auto-fallback to manual config"""
@@ -744,46 +1016,53 @@ class EnhancedGraphRAGRunner:
             # Ensure the project root directory exists
             self.project_root.mkdir(parents=True, exist_ok=True)
             
+            # Extract base endpoint from full URL if needed
+            azure_endpoint_full = self.azure_manager.openai_endpoint
+            if azure_endpoint_full and "/openai/" in azure_endpoint_full:
+                azure_endpoint = azure_endpoint_full.split("/openai/")[0]
+            else:
+                azure_endpoint = azure_endpoint_full
+            
             settings_content = f"""
-    llm:
+llm:
+  api_key: {self.azure_manager.openai_key}
+  type: azure_openai_chat
+  model: gpt-4o
+  api_base: {azure_endpoint}
+  api_version: {self.azure_manager.openai_api_version}
+  deployment_name: {self.azure_manager.openai_deployment_chat}
+  tokens_per_minute: 150000
+  requests_per_minute: 1000
+
+embeddings:
+  llm:
     api_key: {self.azure_manager.openai_key}
-    type: azure_openai_chat
-    model: gpt-4o
-    api_base: {self.azure_manager.openai_endpoint}
+    type: azure_openai_embedding
+    model: text-embedding-3-large
+    api_base: {azure_endpoint}
     api_version: {self.azure_manager.openai_api_version}
-    deployment_name: gpt-4
-    tokens_per_minute: 150000
-    requests_per_minute: 1000
+    deployment_name: {self.azure_manager.openai_deployment_embed}
 
-    embeddings:
-    llm:
-        api_key: {self.azure_manager.openai_key}
-        type: azure_openai_embedding
-        model: text-embedding-3-large
-        api_base: {self.azure_manager.openai_endpoint}
-        api_version: {self.azure_manager.openai_api_version}
-        deployment_name: text-embedding-3-large
+input:
+  type: file
+  base_dir: "./input"
+  file_pattern: ".*\\.txt$"
 
-    input:
-    type: file
-    base_dir: "./input"
-    file_pattern: ".*\\.txt$"
+storage:
+  type: file
+  base_dir: "./output"
 
-    storage:
-    type: file
-    base_dir: "./output"
+chunk:
+  size: 300
+  overlap: 100
 
-    chunk:
-    size: 300
-    overlap: 100
+entity_extraction:
+  entity_types: [organization,person,geo,event]
 
-    entity_extraction:
-    entity_types: [organization,person,geo,event]
-
-    local_search:
-    top_k_mapped_entities: 10
-    max_tokens: 16384
-    """
+local_search:
+  top_k_mapped_entities: 10
+  max_tokens: 16384
+"""
             
             # Create settings.yaml
             settings_file = self.project_root / "settings.yaml"
@@ -804,25 +1083,29 @@ class EnhancedGraphRAGRunner:
             import traceback
             traceback.print_exc()
             return False
-            
+    
     def run_indexing(self):
-        """Run the GraphRAG indexing process with status updates"""
+        """Run the GraphRAG indexing process with status updates and blob PDF processing"""
         original_dir = os.getcwd()
         os.chdir(self.project_root)
         
         try:
             print("🔄 Starting GraphRAG indexing process...")
             
-            # Check for input files
+            # Step 1: Process PDFs from blob storage
+            if not self.process_blob_pdfs_for_graphrag():
+                print("❌ Failed to process PDFs from blob storage")
+                return False
+            
+            # Step 2: Check for input files
             input_files = list((self.project_root / "input").glob("*.txt"))
-            import pdb; pdb.set_trace()
             if not input_files:
-                print("❌ No .txt files found in ./input directory")
+                print("❌ No .txt files found in ./input directory after processing")
                 return False
             
             print(f"📁 Processing {len(input_files)} files")
             
-            # Update Cosmos DB status
+            # Step 3: Update Cosmos DB status
             documents = self.cosmos_manager.list_processed_documents()
             for doc in documents:
                 if doc.get("graphrag_status") == "pending":
@@ -832,7 +1115,7 @@ class EnhancedGraphRAGRunner:
                         {"stage": "indexing_started"}
                     )
             
-            # Try indexing commands
+            # Step 4: Try indexing commands
             commands_to_try = [
                 ['python', '-m', 'graphrag.index', '--root', '.'],
                 ['graphrag', 'index', '--root', '.'],
@@ -858,7 +1141,7 @@ class EnhancedGraphRAGRunner:
                     print(f"⚠️ Error: {e}")
                     continue
             
-            # Update Cosmos DB status
+            # Step 5: Update Cosmos DB status
             status = "completed" if success else "failed"
             stage_info = {
                 "stage": f"indexing_{status}",
@@ -876,6 +1159,8 @@ class EnhancedGraphRAGRunner:
             return False
         finally:
             os.chdir(original_dir)
+            # Clean up temporary files
+            self.blob_manager.cleanup_temp_files()
     
     def enhanced_query(self, query: str, method: str = "both") -> Dict[str, Any]:
         """Enhanced query combining Azure Search and GraphRAG"""
@@ -977,8 +1262,11 @@ class EnhancedGraphRAGRunner:
             return f"Error creating answer: {e}"
     
     def setup_and_run(self, query: str = None):
-        """Complete setup and optional query execution"""
-        print("🚀 Setting up Enhanced GraphRAG...")
+        """Complete setup and optional query execution with blob storage integration"""
+        print("🚀 Setting up Enhanced GraphRAG with Blob Storage Integration...")
+        
+        # List available PDFs in blob storage
+        self.list_available_pdfs_in_blob()
         
         if not self.initialize_graphrag():
             print("❌ Failed to initialize GraphRAG")
@@ -994,7 +1282,11 @@ class EnhancedGraphRAGRunner:
         
         print("✓ GraphRAG setup complete and ready for queries")
         return True
-
+    
+    def __del__(self):
+        """Cleanup temporary files when object is destroyed"""
+        if hasattr(self, 'blob_manager'):
+            self.blob_manager.cleanup_temp_files()
 
 def main():
     """Enhanced main execution function"""
